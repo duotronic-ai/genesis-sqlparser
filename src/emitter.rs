@@ -3,18 +3,25 @@
 //! PG-targeted SQL emitter.
 //!
 //! The upstream sqlparser `Display` impl emits MySQL-flavored SQL.
-//! This module provides a `PgEmitter` that writes PostgreSQL-executable SQL.
-//! The emitter is intentionally conservative: it normalizes the MySQL-specific
-//! surfaces that the proxy depends on while preserving the rest of the AST's
-//! canonical `Display` formatting.
+//! This module provides a `PgEmitter` that writes PostgreSQL-executable SQL:
+//! - Backtick identifiers → double-quoted
+//! - `?` placeholders → `$N`
+//! - `LIMIT offset, count` → `LIMIT count OFFSET offset`
+//! - MySQL double-quoted strings → single-quoted strings
+//! - Strips MySQL-only table options (ENGINE=, CHARSET=, COLLATE=)
+//! - Rejects unsupported MySQL-only constructs (INSERT IGNORE, REPLACE INTO,
+//!   ON DUPLICATE KEY UPDATE)
+//!
+//! The emitter uses the AST-visitor approach (`VisitorMut`) for transformations
+//! and the AST `Display` impl for final output, avoiding re-tokenization which
+//! would corrupt escaped literals.
 
-use crate::{
-    ast::{CreateTableOptions, Ident, SqlOption, Statement},
-    dialect::MySqlDialect,
-    keywords::Keyword,
-    tokenizer::{Token, Tokenizer},
+use crate::ast::{
+    CreateTableOptions, Ident, LimitClause, Offset, OffsetRows, OnInsert, Query, SqlOption,
+    Statement, Value, ValueWithSpan, VisitMut, VisitorMut,
 };
 use core::fmt;
+use core::ops::ControlFlow;
 
 /// Options controlling PG SQL emission.
 #[derive(Debug, Clone)]
@@ -118,21 +125,244 @@ impl SqlEmitter for PgEmitter {
         stmt: &Statement,
         out: &mut W,
     ) -> Result<(), EmitError> {
-        let sql = normalized_statement_sql(stmt);
-        let tokens = Tokenizer::new(&MySqlDialect {}, &sql)
-            .tokenize()
-            .map_err(|err| EmitError::UnsupportedNode(err.to_string()))?;
-        let rendered = render_postgres_sql(self, &tokens);
-        out.write_str(&rendered)?;
+        // 1. Validate: reject MySQL-only constructs that can't be translated.
+        validate_statement(stmt)?;
+
+        // 2. Clone the AST and apply transformations via VisitorMut.
+        let mut stmt = stmt.clone();
+
+        // Strip MySQL-only CREATE TABLE options.
+        strip_mysql_create_table_options(&mut stmt);
+
+        // Apply AST-level rewrites: backtick→double-quote identifiers,
+        // ?→$N placeholders, LIMIT offset,count→LIMIT count OFFSET offset,
+        // double-quoted strings→single-quoted strings.
+        let mut rewriter = PgRewriter { emitter: self };
+        let _ = stmt.visit(&mut rewriter);
+
+        // 3. Use the AST's Display impl for output — then fix up any
+        //    remaining backtick-quoted identifiers that the visitor couldn't
+        //    reach (column defs, non-expression aliases, etc.).
+        let sql = stmt.to_string();
+        let fixed = rewrite_backtick_to_double_quote(&sql);
+        out.write_str(&fixed)?;
         Ok(())
     }
 }
 
-fn normalized_statement_sql(stmt: &Statement) -> String {
-    let mut stmt = stmt.clone();
-    strip_mysql_create_table_options(&mut stmt);
-    stmt.to_string()
+// ---------------------------------------------------------------------------
+// Validation: reject MySQL-only constructs
+// ---------------------------------------------------------------------------
+
+fn validate_statement(stmt: &Statement) -> Result<(), EmitError> {
+    match stmt {
+        Statement::Insert(insert) => {
+            if insert.replace_into {
+                return Err(EmitError::UnsupportedNode(
+                    "REPLACE INTO is MySQL-only; use INSERT ... ON CONFLICT for PG".into(),
+                ));
+            }
+            if insert.ignore {
+                return Err(EmitError::UnsupportedNode(
+                    "INSERT IGNORE is MySQL-only; use INSERT ... ON CONFLICT DO NOTHING for PG"
+                        .into(),
+                ));
+            }
+            if let Some(OnInsert::DuplicateKeyUpdate(_)) = &insert.on {
+                return Err(EmitError::UnsupportedNode(
+                    "ON DUPLICATE KEY UPDATE is MySQL-only; use ON CONFLICT ... DO UPDATE for PG"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
+
+// ---------------------------------------------------------------------------
+// AST visitor: PgRewriter
+// ---------------------------------------------------------------------------
+
+struct PgRewriter<'a> {
+    emitter: &'a mut PgEmitter,
+}
+
+impl VisitorMut for PgRewriter<'_> {
+    type Break = ();
+
+    /// Rewrite identifiers: backtick → double-quote.
+    fn post_visit_relation(
+        &mut self,
+        relation: &mut crate::ast::ObjectName,
+    ) -> ControlFlow<Self::Break> {
+        for part in relation.0.iter_mut() {
+            if let crate::ast::ObjectNamePart::Identifier(ident) = part {
+                rewrite_ident(ident);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Rewrite expressions: backtick idents, ?→$N placeholders.
+    fn post_visit_expr(&mut self, expr: &mut crate::ast::Expr) -> ControlFlow<Self::Break> {
+        match expr {
+            crate::ast::Expr::Identifier(ident) => {
+                rewrite_ident(ident);
+            }
+            crate::ast::Expr::CompoundIdentifier(idents) => {
+                for ident in idents.iter_mut() {
+                    rewrite_ident(ident);
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Rewrite values: ?→$N placeholders, double-quoted strings→single-quoted.
+    fn post_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+        match &value.value {
+            Value::Placeholder(p) if p == "?" => {
+                value.value = Value::Placeholder(self.emitter.next_placeholder());
+            }
+            Value::DoubleQuotedString(s) => {
+                // In MySQL without ANSI_QUOTES, double-quoted strings are string
+                // literals. In PG, double-quotes denote identifiers. Convert to
+                // single-quoted string.
+                value.value = Value::SingleQuotedString(s.clone());
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Rewrite LIMIT offset, count → LIMIT count OFFSET offset.
+    fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        if let Some(LimitClause::OffsetCommaLimit { offset, limit }) =
+            query.limit_clause.take()
+        {
+            query.limit_clause = Some(LimitClause::LimitOffset {
+                limit: Some(limit),
+                offset: Some(Offset {
+                    value: offset,
+                    rows: OffsetRows::None,
+                }),
+                limit_by: vec![],
+            });
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Rewrite select items that contain backtick-quoted aliases.
+    fn post_visit_select(&mut self, select: &mut crate::ast::Select) -> ControlFlow<Self::Break> {
+        for item in select.projection.iter_mut() {
+            if let crate::ast::SelectItem::ExprWithAlias { alias, .. } = item {
+                rewrite_ident(alias);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Rewrite a single identifier: backtick quote style → double-quote.
+fn rewrite_ident(ident: &mut Ident) {
+    if ident.quote_style == Some('`') {
+        ident.quote_style = Some('"');
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Post-serialization backtick→double-quote rewrite
+// ---------------------------------------------------------------------------
+
+/// Replace backtick-quoted identifiers with double-quoted identifiers in SQL text.
+/// This is safe because backticks never appear inside SQL string literals
+/// (single-quoted or double-quoted), so we only need to handle the case where
+/// we're inside a backtick-delimited identifier.
+fn rewrite_backtick_to_double_quote(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            // Skip over single-quoted strings (including '' escapes)
+            '\'' => {
+                out.push('\'');
+                loop {
+                    match chars.next() {
+                        Some('\'') => {
+                            // Check for escaped quote ''
+                            if chars.peek() == Some(&'\'') {
+                                out.push('\'');
+                                out.push('\'');
+                                chars.next();
+                            } else {
+                                out.push('\'');
+                                break;
+                            }
+                        }
+                        Some(ch) => out.push(ch),
+                        None => break,
+                    }
+                }
+            }
+            // Skip over double-quoted identifiers/strings
+            '"' => {
+                out.push('"');
+                loop {
+                    match chars.next() {
+                        Some('"') => {
+                            if chars.peek() == Some(&'"') {
+                                out.push('"');
+                                out.push('"');
+                                chars.next();
+                            } else {
+                                out.push('"');
+                                break;
+                            }
+                        }
+                        Some(ch) => out.push(ch),
+                        None => break,
+                    }
+                }
+            }
+            // Rewrite backtick-quoted identifiers
+            '`' => {
+                out.push('"');
+                loop {
+                    match chars.next() {
+                        Some('`') => {
+                            if chars.peek() == Some(&'`') {
+                                // Escaped backtick `` → escaped double-quote ""
+                                out.push('"');
+                                out.push('"');
+                                chars.next();
+                            } else {
+                                out.push('"');
+                                break;
+                            }
+                        }
+                        Some('"') => {
+                            // Literal double-quote inside backtick ident needs escaping
+                            out.push('"');
+                            out.push('"');
+                        }
+                        Some(ch) => out.push(ch),
+                        None => break,
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// MySQL CREATE TABLE option stripping
+// ---------------------------------------------------------------------------
 
 fn strip_mysql_create_table_options(stmt: &mut Statement) {
     let Statement::CreateTable(create) = stmt else {
@@ -196,157 +426,6 @@ fn is_mysql_table_option_key(key: &str) -> bool {
     )
 }
 
-fn render_postgres_sql(emitter: &mut PgEmitter, tokens: &[Token]) -> String {
-    let mut out = String::new();
-    let mut index = 0;
-
-    while index < tokens.len() {
-        if let Some((rendered_limit, consumed)) =
-            try_render_limit_offset_clause(emitter, tokens, index)
-        {
-            while out.ends_with(char::is_whitespace) {
-                out.pop();
-            }
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(&rendered_limit);
-            index += consumed;
-            continue;
-        }
-
-        render_token(emitter, &tokens[index], &mut out);
-        index += 1;
-    }
-
-    out
-}
-
-fn render_token(emitter: &mut PgEmitter, token: &Token, out: &mut String) {
-    match token {
-        Token::Word(word) if word.quote_style == Some('`') => {
-            out.push('"');
-            out.push_str(&word.value.replace('"', "\"\""));
-            out.push('"');
-        }
-        Token::Placeholder(value) if value == "?" => out.push_str(&emitter.next_placeholder()),
-        _ => out.push_str(&token.to_string()),
-    }
-}
-
-fn try_render_limit_offset_clause(
-    emitter: &mut PgEmitter,
-    tokens: &[Token],
-    start: usize,
-) -> Option<(String, usize)> {
-    let Token::Word(word) = &tokens[start] else {
-        return None;
-    };
-    if word.keyword != Keyword::LIMIT {
-        return None;
-    }
-
-    let first_expr_start = skip_trivia(tokens, start + 1);
-    let (first_expr_end, comma_index) = scan_limit_expr_until_comma(tokens, first_expr_start)?;
-    let second_expr_start = skip_trivia(tokens, comma_index + 1);
-    let second_expr_end = scan_limit_expr_end(tokens, second_expr_start);
-
-    let first = render_token_range(emitter, tokens, first_expr_start, first_expr_end)
-        .trim()
-        .to_string();
-    let second = render_token_range(emitter, tokens, second_expr_start, second_expr_end)
-        .trim()
-        .to_string();
-    if first.is_empty() || second.is_empty() {
-        return None;
-    }
-
-    Some((format!("LIMIT {second} OFFSET {first}"), second_expr_end - start))
-}
-
-fn skip_trivia(tokens: &[Token], mut index: usize) -> usize {
-    while index < tokens.len() && matches!(tokens[index], Token::Whitespace(_)) {
-        index += 1;
-    }
-    index
-}
-
-fn scan_limit_expr_until_comma(tokens: &[Token], start: usize) -> Option<(usize, usize)> {
-    let mut depth = 0usize;
-    let mut index = start;
-
-    while index < tokens.len() {
-        match &tokens[index] {
-            Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
-            Token::RParen | Token::RBracket | Token::RBrace => {
-                if depth == 0 {
-                    return None;
-                }
-                depth -= 1;
-            }
-            Token::Comma if depth == 0 => return Some((index, index)),
-            Token::EOF | Token::SemiColon if depth == 0 => return None,
-            _ => {}
-        }
-        index += 1;
-    }
-
-    None
-}
-
-fn scan_limit_expr_end(tokens: &[Token], start: usize) -> usize {
-    let mut depth = 0usize;
-    let mut index = start;
-
-    while index < tokens.len() {
-        match &tokens[index] {
-            Token::LParen | Token::LBracket | Token::LBrace => depth += 1,
-            Token::RParen | Token::RBracket | Token::RBrace => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            }
-            Token::SemiColon | Token::EOF if depth == 0 => break,
-            Token::Word(word)
-                if depth == 0
-                    && matches!(
-                        word.keyword,
-                        Keyword::LIMIT
-                            | Keyword::OFFSET
-                            | Keyword::FETCH
-                            | Keyword::FOR
-                            | Keyword::UNION
-                            | Keyword::EXCEPT
-                            | Keyword::INTERSECT
-                            | Keyword::ORDER
-                    ) =>
-            {
-                break;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-
-    trim_trailing_trivia(tokens, start, index)
-}
-
-fn trim_trailing_trivia(tokens: &[Token], start: usize, mut end: usize) -> usize {
-    while end > start && matches!(tokens[end - 1], Token::Whitespace(_)) {
-        end -= 1;
-    }
-    end
-}
-
-fn render_token_range(emitter: &mut PgEmitter, tokens: &[Token], start: usize, end: usize) -> String {
-    let mut rendered = String::new();
-    for token in &tokens[start..end] {
-        render_token(emitter, token, &mut rendered);
-    }
-    rendered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,13 +439,35 @@ mod tests {
         out
     }
 
+    fn emit_sql_err(sql: &str) -> EmitError {
+        let stmt = Parser::parse_sql(&MySqlDialect {}, sql).unwrap().remove(0);
+        let mut emitter = PgEmitter::new(EmitOptions::postgres());
+        let mut out = String::new();
+        emitter.emit_statement(&stmt, &mut out).unwrap_err()
+    }
+
     #[test]
     fn rewrites_placeholders_and_backtick_identifiers() {
-        let emitted = emit_sql(r#"SELECT "value", `user`.`name`, ?, ? FROM `accounts`"#);
+        let emitted = emit_sql(r#"SELECT `user`.`name`, ?, ? FROM `accounts`"#);
         assert_eq!(
             emitted,
-            r#"SELECT "value", "user"."name", $1, $2 FROM "accounts""#
+            r#"SELECT "user"."name", $1, $2 FROM "accounts""#
         );
+    }
+
+    #[test]
+    fn rewrites_mysql_double_quoted_strings_to_single_quoted() {
+        // In MySQL (no ANSI_QUOTES), "abc" is a string literal.
+        // In PG, it must become 'abc'.
+        let emitted = emit_sql(r#"SELECT "abc" FROM `t`"#);
+        assert_eq!(emitted, r#"SELECT 'abc' FROM "t""#);
+    }
+
+    #[test]
+    fn preserves_escaped_single_quoted_literals() {
+        // O'Reilly contains an escaped single quote; must survive round-trip.
+        let emitted = emit_sql("SELECT 'O''Reilly' FROM `t`");
+        assert_eq!(emitted, r#"SELECT 'O''Reilly' FROM "t""#);
     }
 
     #[test]
@@ -392,5 +493,33 @@ mod tests {
             "CREATE TABLE `users` (`id` INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
         );
         assert_eq!(emitted, r#"CREATE TABLE "users" ("id" INT)"#);
+    }
+
+    #[test]
+    fn rejects_insert_ignore() {
+        let err = emit_sql_err("INSERT IGNORE INTO `t` (`a`) VALUES (1)");
+        assert!(matches!(err, EmitError::UnsupportedNode(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("INSERT IGNORE"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_replace_into() {
+        let err = emit_sql_err("REPLACE INTO `t` (`a`) VALUES (1)");
+        assert!(matches!(err, EmitError::UnsupportedNode(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("REPLACE INTO"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_on_duplicate_key_update() {
+        let err =
+            emit_sql_err("INSERT INTO `t` (`a`) VALUES (1) ON DUPLICATE KEY UPDATE `a` = 2");
+        assert!(matches!(err, EmitError::UnsupportedNode(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ON DUPLICATE KEY UPDATE"),
+            "got: {msg}"
+        );
     }
 }
