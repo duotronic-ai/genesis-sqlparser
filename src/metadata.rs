@@ -6,7 +6,14 @@
 //! The parser detects syntax-local facts (statement kind, insert strategy,
 //! placeholder positions) so the translator consumes them directly.
 
-use crate::ast::Statement;
+use core::ops::ControlFlow;
+
+use crate::ast::{
+    Expr, Function, ObjectType, OnInsert, Query, Select, SetExpr, Statement, TableFactor, Value,
+    Visit, Visitor,
+};
+use crate::mysql_mode::{MySqlModeFlags, parse_mysql_sql};
+use crate::parser::ParserError;
 
 /// Coarse statement classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,10 +80,21 @@ impl StmtFlags {
     pub const HAS_USER_VARS: u32 = 1 << 4;
     /// Contains GROUP_CONCAT or similar aggregate needing rewrite.
     pub const HAS_AGGREGATE_REWRITE: u32 = 1 << 5;
+    /// Contains an ORDER BY clause.
+    pub const HAS_ORDER_BY: u32 = 1 << 6;
+    /// Contains a LIMIT clause.
+    pub const HAS_LIMIT: u32 = 1 << 7;
+    /// INSERT source is a SELECT-like query rather than VALUES/SET.
+    pub const IS_INSERT_SELECT: u32 = 1 << 8;
 
     /// Create empty flags.
     pub const fn empty() -> Self {
         Self(0)
+    }
+
+    /// Return the raw bits.
+    pub const fn bits(self) -> u32 {
+        self.0
     }
 
     /// Check if a flag is set.
@@ -122,4 +140,338 @@ pub struct ParsedStatement {
     pub stmt: Statement,
     /// Translation metadata detected during parsing.
     pub meta: TranslationMetadata,
+}
+
+struct MetadataCollector {
+    flags: StmtFlags,
+    placeholder_count: u16,
+}
+
+impl MetadataCollector {
+    fn new() -> Self {
+        Self {
+            flags: StmtFlags::empty(),
+            placeholder_count: 0,
+        }
+    }
+
+    fn finish(self) -> (StmtFlags, u16) {
+        (self.flags, self.placeholder_count)
+    }
+}
+
+impl Visitor for MetadataCollector {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        if query.order_by.is_some() {
+            self.flags.insert(StmtFlags::HAS_ORDER_BY);
+        }
+        if query.limit_clause.is_some() {
+            self.flags.insert(StmtFlags::HAS_LIMIT);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
+        if select
+            .select_modifiers
+            .as_ref()
+            .is_some_and(|mods| mods.sql_calc_found_rows)
+        {
+            self.flags.insert(StmtFlags::HAS_FOUND_ROWS);
+        }
+        if !select.sort_by.is_empty() {
+            self.flags.insert(StmtFlags::HAS_ORDER_BY);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if matches!(table_factor, TableFactor::Derived { .. }) {
+            self.flags.insert(StmtFlags::HAS_SUBQUERY);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        match expr {
+            Expr::Subquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::AnyOp { .. }
+            | Expr::AllOp { .. } => self.flags.insert(StmtFlags::HAS_SUBQUERY),
+            Expr::Function(fun) => record_function_flags(fun, &mut self.flags),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+        match statement {
+            Statement::Update(update) => {
+                if !update.order_by.is_empty() {
+                    self.flags.insert(StmtFlags::HAS_ORDER_BY);
+                }
+                if update.limit.is_some() {
+                    self.flags.insert(StmtFlags::HAS_LIMIT);
+                }
+            }
+            Statement::Delete(delete) => {
+                if !delete.order_by.is_empty() {
+                    self.flags.insert(StmtFlags::HAS_ORDER_BY);
+                }
+                if delete.limit.is_some() {
+                    self.flags.insert(StmtFlags::HAS_LIMIT);
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_value(
+        &mut self,
+        value: &crate::ast::ValueWithSpan,
+    ) -> ControlFlow<Self::Break> {
+        if matches!(value.value, Value::Placeholder(_)) {
+            self.placeholder_count = self.placeholder_count.saturating_add(1);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn record_function_flags(function: &Function, flags: &mut StmtFlags) {
+    let Some(name) = function.name.0.last() else {
+        return;
+    };
+    let function_name = name.to_string().to_ascii_uppercase();
+    match function_name.as_str() {
+        "LAST_INSERT_ID" => flags.insert(StmtFlags::HAS_LAST_INSERT_ID),
+        "GROUP_CONCAT" => flags.insert(StmtFlags::HAS_AGGREGATE_REWRITE),
+        _ => {}
+    }
+}
+
+fn classify_statement(stmt: &Statement) -> StatementKind {
+    match stmt {
+        Statement::Query(_) => StatementKind::Select,
+        Statement::Insert(_) => StatementKind::Insert,
+        Statement::Update(_) => StatementKind::Update,
+        Statement::Delete(_) => StatementKind::Delete,
+        Statement::CreateTable(_) => StatementKind::CreateTable,
+        Statement::AlterTable(_) => StatementKind::AlterTable,
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            ..
+        } => StatementKind::DropTable,
+        Statement::ShowFunctions { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::ShowStatus { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowProcessList { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowCharset(_)
+        | Statement::ShowObjects(_)
+        | Statement::ShowTables { .. }
+        | Statement::ShowViews { .. }
+        | Statement::ShowCollation { .. } => StatementKind::Show,
+        Statement::Set(_) => StatementKind::Set,
+        Statement::Use(_) => StatementKind::Use,
+        Statement::StartTransaction { .. } => StatementKind::Begin,
+        Statement::Commit { .. } => StatementKind::Commit,
+        Statement::Rollback { .. } => StatementKind::Rollback,
+        Statement::Savepoint { .. } | Statement::ReleaseSavepoint { .. } => {
+            StatementKind::Savepoint
+        }
+        _ => StatementKind::Other,
+    }
+}
+
+fn is_ddl_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::CreateView(_)
+            | Statement::CreateTable(_)
+            | Statement::CreateVirtualTable { .. }
+            | Statement::CreateIndex(_)
+            | Statement::CreateRole(_)
+            | Statement::CreateSecret { .. }
+            | Statement::CreateServer(_)
+            | Statement::CreatePolicy(_)
+            | Statement::CreateConnector(_)
+            | Statement::CreateOperator(_)
+            | Statement::CreateOperatorFamily(_)
+            | Statement::CreateOperatorClass(_)
+            | Statement::AlterTable(_)
+            | Statement::AlterSchema(_)
+            | Statement::AlterIndex { .. }
+            | Statement::AlterView { .. }
+            | Statement::AlterFunction(_)
+            | Statement::AlterType(_)
+            | Statement::AlterOperator(_)
+            | Statement::AlterOperatorFamily(_)
+            | Statement::AlterOperatorClass(_)
+            | Statement::AlterRole { .. }
+            | Statement::AlterPolicy(_)
+            | Statement::AlterConnector { .. }
+            | Statement::Drop { .. }
+            | Statement::DropFunction(_)
+            | Statement::DropDomain(_)
+            | Statement::DropProcedure { .. }
+            | Statement::DropSecret { .. }
+            | Statement::DropPolicy(_)
+            | Statement::DropConnector { .. }
+            | Statement::CreateExtension(_)
+            | Statement::DropExtension(_)
+            | Statement::DropOperator(_)
+            | Statement::DropOperatorFamily(_)
+            | Statement::DropOperatorClass(_)
+            | Statement::CreateSchema { .. }
+            | Statement::CreateDatabase { .. }
+            | Statement::CreateFunction(_)
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger(_)
+            | Statement::CreateProcedure { .. }
+            | Statement::CreateMacro { .. }
+            | Statement::CreateStage { .. }
+            | Statement::CreateSequence { .. }
+            | Statement::CreateDomain(_)
+            | Statement::CreateType { .. }
+            | Statement::Truncate(_)
+    )
+}
+
+fn insert_strategy(stmt: &Statement) -> Option<InsertStrategy> {
+    let Statement::Insert(insert) = stmt else {
+        return None;
+    };
+
+    let strategy = if insert.replace_into {
+        InsertStrategy::Replace
+    } else if insert.ignore {
+        InsertStrategy::Ignore
+    } else if matches!(insert.on, Some(OnInsert::DuplicateKeyUpdate(_))) {
+        InsertStrategy::OnDuplicateKeyUpdate
+    } else {
+        InsertStrategy::Plain
+    };
+
+    Some(strategy)
+}
+
+fn is_insert_select(stmt: &Statement) -> bool {
+    let Statement::Insert(insert) = stmt else {
+        return false;
+    };
+    let Some(source) = insert.source.as_ref() else {
+        return false;
+    };
+    !matches!(source.body.as_ref(), SetExpr::Values(_))
+}
+
+/// Parse a single MySQL statement using a session-aware dialect and attach
+/// translation metadata that later rewrite/emission stages can consume.
+pub fn parse_mysql_statement(
+    sql: &str,
+    flags: MySqlModeFlags,
+) -> Result<ParsedStatement, ParserError> {
+    let mut statements = parse_mysql_sql(sql, flags)?;
+    if statements.len() != 1 {
+        return Err(ParserError::ParserError(format!(
+            "expected exactly one statement, found {}",
+            statements.len()
+        )));
+    }
+
+    let stmt = statements.pop().expect("checked length");
+    let mut collector = MetadataCollector::new();
+    let _ = stmt.visit(&mut collector);
+    let (mut stmt_flags, placeholder_count) = collector.finish();
+    if is_ddl_statement(&stmt) {
+        stmt_flags.insert(StmtFlags::IS_DDL);
+    }
+    if is_insert_select(&stmt) {
+        stmt_flags.insert(StmtFlags::IS_INSERT_SELECT);
+    }
+
+    let meta = TranslationMetadata {
+        stmt_kind: classify_statement(&stmt),
+        stmt_flags,
+        insert_strategy: insert_strategy(&stmt),
+        placeholder_count,
+    };
+
+    Ok(ParsedStatement { stmt, meta })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_collects_select_flags_and_placeholders() {
+        let parsed = parse_mysql_statement(
+            "SELECT SQL_CALC_FOUND_ROWS * FROM users ORDER BY created_at LIMIT ?, ?",
+            MySqlModeFlags::empty(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.meta.stmt_kind, StatementKind::Select);
+        assert!(parsed.meta.stmt_flags.contains(StmtFlags::HAS_FOUND_ROWS));
+        assert!(parsed.meta.stmt_flags.contains(StmtFlags::HAS_ORDER_BY));
+        assert!(parsed.meta.stmt_flags.contains(StmtFlags::HAS_LIMIT));
+        assert_eq!(parsed.meta.placeholder_count, 2);
+    }
+
+    #[test]
+    fn metadata_detects_insert_select_and_strategy() {
+        let parsed = parse_mysql_statement(
+            "INSERT IGNORE INTO dst (id) SELECT id FROM src",
+            MySqlModeFlags::empty(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.meta.stmt_kind, StatementKind::Insert);
+        assert!(parsed.meta.stmt_flags.contains(StmtFlags::IS_INSERT_SELECT));
+        assert_eq!(parsed.meta.insert_strategy, Some(InsertStrategy::Ignore));
+    }
+
+    #[test]
+    fn metadata_detects_on_duplicate_key_update() {
+        let parsed = parse_mysql_statement(
+            "INSERT INTO dst (id) VALUES (?) ON DUPLICATE KEY UPDATE id = VALUES(id)",
+            MySqlModeFlags::empty(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.meta.insert_strategy,
+            Some(InsertStrategy::OnDuplicateKeyUpdate)
+        );
+        assert_eq!(parsed.meta.placeholder_count, 1);
+    }
+
+    #[test]
+    fn metadata_marks_create_table_as_ddl() {
+        let parsed = parse_mysql_statement(
+            "CREATE TABLE t (id INT)",
+            MySqlModeFlags::empty(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.meta.stmt_kind, StatementKind::CreateTable);
+        assert!(parsed.meta.stmt_flags.contains(StmtFlags::IS_DDL));
+    }
+
+    #[test]
+    fn parse_mysql_statement_rejects_multi_statement_input() {
+        let err = parse_mysql_statement("SELECT 1; SELECT 2", MySqlModeFlags::empty()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("expected exactly one statement, found 2"));
+    }
 }

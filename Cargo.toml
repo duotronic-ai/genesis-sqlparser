@@ -40,7 +40,7 @@ name = "genesis_sqlparser"
 path = "src/lib.rs"
 
 [features]
-default = ["std", "recursive-protection"]
+default = ["std", "recursive-protection", "visitor"]
 std = []
 recursive-protection = ["std", "recursive"]
 # Enable JSON output in the `cli` example:
