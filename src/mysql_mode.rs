@@ -8,7 +8,7 @@
 use core::any::TypeId;
 
 use crate::ast::Statement;
-use crate::dialect::{Dialect, MySqlDialect};
+use crate::dialect::{Dialect, ModeAwareMySqlDialect, MySqlDialect};
 use crate::parser::{Parser, ParserError};
 
 /// MySQL sql_mode flags that affect parsing behavior.
@@ -256,10 +256,22 @@ pub fn mysql_dialect(flags: MySqlModeFlags) -> SessionMySqlDialect {
     SessionMySqlDialect::new(flags)
 }
 
-/// Parse MySQL SQL using a session-aware dialect configured from `sql_mode`.
-pub fn parse_mysql_sql(sql: &str, flags: MySqlModeFlags) -> Result<Vec<Statement>, ParserError> {
-    let dialect = mysql_dialect(flags);
+/// Parse MySQL SQL using a mode-aware MySQL dialect configured from
+/// session `sql_mode` flags.
+pub fn parse_mysql_with_mode(
+    sql: &str,
+    flags: MySqlModeFlags,
+) -> Result<Vec<Statement>, ParserError> {
+    let dialect = ModeAwareMySqlDialect::new(flags);
     Parser::parse_sql(&dialect, sql)
+}
+
+/// Parse MySQL SQL into raw AST statements.
+///
+/// For metadata-aware parsing, prefer [`crate::metadata::parse_mysql_statement`]
+/// or [`crate::metadata::parse_mysql_sql`].
+pub fn parse_mysql_sql(sql: &str, flags: MySqlModeFlags) -> Result<Vec<Statement>, ParserError> {
+    parse_mysql_with_mode(sql, flags)
 }
 
 /// Parse a sql_mode string (e.g. "ANSI_QUOTES,NO_BACKSLASH_ESCAPES") into flags.
@@ -349,6 +361,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_mysql_with_mode_uses_mode_aware_dialect() {
+        let ast = parse_mysql_with_mode(
+            r#"SELECT "col""#,
+            MySqlModeFlags::from_bits(MySqlModeFlags::ANSI_QUOTES),
+        )
+        .unwrap();
+
+        let Statement::Query(query) = &ast[0] else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let SelectItem::UnnamedExpr(Expr::Identifier(ident)) = &select.projection[0] else {
+            panic!("expected identifier projection");
+        };
+        assert_eq!(ident.value, "col");
+        assert_eq!(ident.quote_style, Some('"'));
+    }
+
+    #[test]
     fn default_mysql_mode_treats_double_quotes_as_strings() {
         let ast = parse_mysql_sql(r#"SELECT "col""#, MySqlModeFlags::empty()).unwrap();
         let Statement::Query(query) = &ast[0] else {
@@ -385,7 +418,10 @@ mod tests {
             value.value.clone()
         };
 
-        assert_eq!(extract(&escaped[0]), Value::SingleQuotedString("a\nb".into()));
+        assert_eq!(
+            extract(&escaped[0]),
+            Value::SingleQuotedString("a\nb".into())
+        );
         assert_eq!(extract(&raw[0]), Value::SingleQuotedString("a\\nb".into()));
     }
 }

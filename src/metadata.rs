@@ -12,7 +12,7 @@ use crate::ast::{
     Expr, Function, ObjectType, OnInsert, Query, Select, SetExpr, Statement, TableFactor, Value,
     Visit, Visitor,
 };
-use crate::mysql_mode::{MySqlModeFlags, parse_mysql_sql};
+use crate::mysql_mode::{parse_mysql_with_mode, MySqlModeFlags};
 use crate::parser::ParserError;
 
 /// Coarse statement classification.
@@ -230,10 +230,7 @@ impl Visitor for MetadataCollector {
         ControlFlow::Continue(())
     }
 
-    fn pre_visit_value(
-        &mut self,
-        value: &crate::ast::ValueWithSpan,
-    ) -> ControlFlow<Self::Break> {
+    fn pre_visit_value(&mut self, value: &crate::ast::ValueWithSpan) -> ControlFlow<Self::Break> {
         if matches!(value.value, Value::Placeholder(_)) {
             self.placeholder_count = self.placeholder_count.saturating_add(1);
         }
@@ -373,21 +370,7 @@ fn is_insert_select(stmt: &Statement) -> bool {
     !matches!(source.body.as_ref(), SetExpr::Values(_))
 }
 
-/// Parse a single MySQL statement using a session-aware dialect and attach
-/// translation metadata that later rewrite/emission stages can consume.
-pub fn parse_mysql_statement(
-    sql: &str,
-    flags: MySqlModeFlags,
-) -> Result<ParsedStatement, ParserError> {
-    let mut statements = parse_mysql_sql(sql, flags)?;
-    if statements.len() != 1 {
-        return Err(ParserError::ParserError(format!(
-            "expected exactly one statement, found {}",
-            statements.len()
-        )));
-    }
-
-    let stmt = statements.pop().expect("checked length");
+fn build_parsed_statement(stmt: Statement) -> ParsedStatement {
     let mut collector = MetadataCollector::new();
     let _ = stmt.visit(&mut collector);
     let (mut stmt_flags, placeholder_count) = collector.finish();
@@ -405,7 +388,43 @@ pub fn parse_mysql_statement(
         placeholder_count,
     };
 
-    Ok(ParsedStatement { stmt, meta })
+    ParsedStatement { stmt, meta }
+}
+
+/// Parse MySQL SQL using the session's mode flags and attach translation
+/// metadata to every parsed statement.
+pub fn parse_mysql_statements(
+    sql: &str,
+    flags: MySqlModeFlags,
+) -> Result<Vec<ParsedStatement>, ParserError> {
+    parse_mysql_with_mode(sql, flags)
+        .map(|statements| statements.into_iter().map(build_parsed_statement).collect())
+}
+
+/// Parse MySQL SQL using the session's mode flags and attach translation
+/// metadata to every parsed statement.
+pub fn parse_mysql_sql(
+    sql: &str,
+    flags: MySqlModeFlags,
+) -> Result<Vec<ParsedStatement>, ParserError> {
+    parse_mysql_statements(sql, flags)
+}
+
+/// Primary metadata-aware parsing API for callers that expect exactly one
+/// statement: parse SQL once and return the statement plus translation hints.
+pub fn parse_mysql_statement(
+    sql: &str,
+    flags: MySqlModeFlags,
+) -> Result<ParsedStatement, ParserError> {
+    let mut statements = parse_mysql_statements(sql, flags)?;
+    if statements.len() != 1 {
+        return Err(ParserError::ParserError(format!(
+            "expected exactly one statement, found {}",
+            statements.len()
+        )));
+    }
+
+    Ok(statements.pop().expect("checked length"))
 }
 
 #[cfg(test)]
@@ -457,14 +476,27 @@ mod tests {
 
     #[test]
     fn metadata_marks_create_table_as_ddl() {
-        let parsed = parse_mysql_statement(
-            "CREATE TABLE t (id INT)",
+        let parsed =
+            parse_mysql_statement("CREATE TABLE t (id INT)", MySqlModeFlags::empty()).unwrap();
+
+        assert_eq!(parsed.meta.stmt_kind, StatementKind::CreateTable);
+        assert!(parsed.meta.stmt_flags.contains(StmtFlags::IS_DDL));
+    }
+
+    #[test]
+    fn parse_mysql_sql_collects_metadata_for_each_statement() {
+        let parsed = parse_mysql_sql(
+            "SELECT ?; INSERT IGNORE INTO dst (id) VALUES (?)",
             MySqlModeFlags::empty(),
         )
         .unwrap();
 
-        assert_eq!(parsed.meta.stmt_kind, StatementKind::CreateTable);
-        assert!(parsed.meta.stmt_flags.contains(StmtFlags::IS_DDL));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].meta.stmt_kind, StatementKind::Select);
+        assert_eq!(parsed[0].meta.placeholder_count, 1);
+        assert_eq!(parsed[1].meta.stmt_kind, StatementKind::Insert);
+        assert_eq!(parsed[1].meta.insert_strategy, Some(InsertStrategy::Ignore));
+        assert_eq!(parsed[1].meta.placeholder_count, 1);
     }
 
     #[test]
