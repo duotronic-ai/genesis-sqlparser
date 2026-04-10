@@ -5,6 +5,12 @@
 //! These flags affect how the MySQL dialect parses SQL. They must be set
 //! before parsing based on the connection's sql_mode.
 
+use core::any::TypeId;
+
+use crate::ast::Statement;
+use crate::dialect::{Dialect, MySqlDialect};
+use crate::parser::{Parser, ParserError};
+
 /// MySQL sql_mode flags that affect parsing behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct MySqlModeFlags(u32);
@@ -68,6 +74,192 @@ impl From<MySqlModeFlags> for MySqlLexerMode {
     }
 }
 
+/// A session-aware MySQL dialect that preserves upstream MySQL parsing behavior
+/// while letting a session's `sql_mode` adjust a small set of lexer/parser rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SessionMySqlDialect {
+    base: MySqlDialect,
+    flags: MySqlModeFlags,
+}
+
+impl SessionMySqlDialect {
+    /// Create a new session-aware MySQL dialect for the provided mode flags.
+    pub const fn new(flags: MySqlModeFlags) -> Self {
+        Self {
+            base: MySqlDialect {},
+            flags,
+        }
+    }
+
+    /// Return the configured mode flags.
+    pub const fn flags(self) -> MySqlModeFlags {
+        self.flags
+    }
+
+    fn lexer_mode(self) -> MySqlLexerMode {
+        self.flags.into()
+    }
+}
+
+impl Dialect for SessionMySqlDialect {
+    fn dialect(&self) -> TypeId {
+        TypeId::of::<MySqlDialect>()
+    }
+
+    fn is_identifier_start(&self, ch: char) -> bool {
+        <MySqlDialect as Dialect>::is_identifier_start(&self.base, ch)
+    }
+
+    fn is_identifier_part(&self, ch: char) -> bool {
+        <MySqlDialect as Dialect>::is_identifier_part(&self.base, ch)
+    }
+
+    fn is_delimited_identifier_start(&self, ch: char) -> bool {
+        ch == '`' || (self.lexer_mode().ansi_quotes && ch == '"')
+    }
+
+    fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
+        if self.lexer_mode().ansi_quotes {
+            Some('"')
+        } else {
+            Some('`')
+        }
+    }
+
+    fn supports_string_literal_backslash_escape(&self) -> bool {
+        !self.lexer_mode().no_backslash_escapes
+    }
+
+    fn supports_string_literal_concatenation(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_string_literal_concatenation(&self.base)
+    }
+
+    fn ignores_wildcard_escapes(&self) -> bool {
+        <MySqlDialect as Dialect>::ignores_wildcard_escapes(&self.base)
+    }
+
+    fn supports_numeric_prefix(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_numeric_prefix(&self.base)
+    }
+
+    fn supports_bitwise_shift_operators(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_bitwise_shift_operators(&self.base)
+    }
+
+    fn supports_multiline_comment_hints(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_multiline_comment_hints(&self.base)
+    }
+
+    fn parse_infix(
+        &self,
+        parser: &mut Parser,
+        expr: &crate::ast::Expr,
+        precedence: u8,
+    ) -> Option<Result<crate::ast::Expr, ParserError>> {
+        <MySqlDialect as Dialect>::parse_infix(&self.base, parser, expr, precedence)
+    }
+
+    fn parse_statement(&self, parser: &mut Parser) -> Option<Result<Statement, ParserError>> {
+        <MySqlDialect as Dialect>::parse_statement(&self.base, parser)
+    }
+
+    fn require_interval_qualifier(&self) -> bool {
+        <MySqlDialect as Dialect>::require_interval_qualifier(&self.base)
+    }
+
+    fn supports_limit_comma(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_limit_comma(&self.base)
+    }
+
+    fn supports_create_table_select(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_create_table_select(&self.base)
+    }
+
+    fn supports_insert_set(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_insert_set(&self.base)
+    }
+
+    fn supports_user_host_grantee(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_user_host_grantee(&self.base)
+    }
+
+    fn is_table_factor_alias(
+        &self,
+        explicit: bool,
+        kw: &crate::keywords::Keyword,
+        parser: &mut Parser,
+    ) -> bool {
+        <MySqlDialect as Dialect>::is_table_factor_alias(&self.base, explicit, kw, parser)
+    }
+
+    fn supports_table_hints(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_table_hints(&self.base)
+    }
+
+    fn requires_single_line_comment_whitespace(&self) -> bool {
+        <MySqlDialect as Dialect>::requires_single_line_comment_whitespace(&self.base)
+    }
+
+    fn supports_match_against(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_match_against(&self.base)
+    }
+
+    fn supports_select_modifiers(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_select_modifiers(&self.base)
+    }
+
+    fn supports_set_names(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_set_names(&self.base)
+    }
+
+    fn supports_comma_separated_set_assignments(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_comma_separated_set_assignments(&self.base)
+    }
+
+    fn supports_update_order_by(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_update_order_by(&self.base)
+    }
+
+    fn supports_data_type_signed_suffix(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_data_type_signed_suffix(&self.base)
+    }
+
+    fn supports_cross_join_constraint(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_cross_join_constraint(&self.base)
+    }
+
+    fn supports_double_ampersand_operator(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_double_ampersand_operator(&self.base)
+    }
+
+    fn supports_binary_kw_as_cast(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_binary_kw_as_cast(&self.base)
+    }
+
+    fn supports_comment_optimizer_hint(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_comment_optimizer_hint(&self.base)
+    }
+
+    fn supports_constraint_keyword_without_name(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_constraint_keyword_without_name(&self.base)
+    }
+
+    fn supports_key_column_option(&self) -> bool {
+        <MySqlDialect as Dialect>::supports_key_column_option(&self.base)
+    }
+}
+
+/// Create a session-aware MySQL dialect for the provided `sql_mode` flags.
+pub fn mysql_dialect(flags: MySqlModeFlags) -> SessionMySqlDialect {
+    SessionMySqlDialect::new(flags)
+}
+
+/// Parse MySQL SQL using a session-aware dialect configured from `sql_mode`.
+pub fn parse_mysql_sql(sql: &str, flags: MySqlModeFlags) -> Result<Vec<Statement>, ParserError> {
+    let dialect = mysql_dialect(flags);
+    Parser::parse_sql(&dialect, sql)
+}
+
 /// Parse a sql_mode string (e.g. "ANSI_QUOTES,NO_BACKSLASH_ESCAPES") into flags.
 pub fn parse_sql_mode(sql_mode: &str) -> MySqlModeFlags {
     let mut flags = MySqlModeFlags::empty();
@@ -95,6 +287,8 @@ pub fn parse_sql_mode(sql_mode: &str) -> MySqlModeFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Expr, SelectItem, SetExpr, Statement, Value};
+    use crate::parser::Parser;
 
     #[test]
     fn parse_empty_mode() {
@@ -131,5 +325,65 @@ mod tests {
         let lexer: MySqlLexerMode = flags.into();
         assert!(lexer.ansi_quotes);
         assert!(!lexer.no_backslash_escapes);
+    }
+
+    #[test]
+    fn ansi_quotes_treats_double_quotes_as_identifiers() {
+        let sql = r#"SELECT "col" FROM "tbl""name""#;
+        let dialect = mysql_dialect(MySqlModeFlags::from_bits(MySqlModeFlags::ANSI_QUOTES));
+        let ast = Parser::parse_sql(&dialect, sql).unwrap();
+
+        let Statement::Query(query) = &ast[0] else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let SelectItem::UnnamedExpr(Expr::Identifier(ident)) = &select.projection[0] else {
+            panic!("expected identifier projection");
+        };
+        assert_eq!(ident.value, "col");
+        assert_eq!(ident.quote_style, Some('"'));
+    }
+
+    #[test]
+    fn default_mysql_mode_treats_double_quotes_as_strings() {
+        let ast = parse_mysql_sql(r#"SELECT "col""#, MySqlModeFlags::empty()).unwrap();
+        let Statement::Query(query) = &ast[0] else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let SelectItem::UnnamedExpr(Expr::Value(value)) = &select.projection[0] else {
+            panic!("expected string literal");
+        };
+        assert_eq!(value.value, Value::DoubleQuotedString("col".into()));
+    }
+
+    #[test]
+    fn no_backslash_escapes_preserves_literal_backslashes() {
+        let escaped = parse_mysql_sql("SELECT 'a\\nb'", MySqlModeFlags::empty()).unwrap();
+        let raw = parse_mysql_sql(
+            "SELECT 'a\\nb'",
+            MySqlModeFlags::from_bits(MySqlModeFlags::NO_BACKSLASH_ESCAPES),
+        )
+        .unwrap();
+
+        let extract = |stmt: &Statement| -> Value {
+            let Statement::Query(query) = stmt else {
+                panic!("expected query");
+            };
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("expected select");
+            };
+            let SelectItem::UnnamedExpr(Expr::Value(value)) = &select.projection[0] else {
+                panic!("expected value");
+            };
+            value.value.clone()
+        };
+
+        assert_eq!(extract(&escaped[0]), Value::SingleQuotedString("a\nb".into()));
+        assert_eq!(extract(&raw[0]), Value::SingleQuotedString("a\\nb".into()));
     }
 }
