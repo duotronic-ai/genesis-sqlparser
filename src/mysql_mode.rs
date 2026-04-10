@@ -12,7 +12,8 @@ use crate::dialect::{Dialect, MySqlDialect};
 use crate::parser::{Parser, ParserError};
 
 /// MySQL sql_mode flags that affect parsing behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MySqlModeFlags(u32);
 
 impl MySqlModeFlags {
@@ -58,6 +59,7 @@ impl MySqlModeFlags {
 /// Subset of mode flags that affect the lexer/tokenizer.
 /// Used by the parameterizer for charset-safe literal extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MySqlLexerMode {
     /// Double-quote is an identifier quote.
     pub ansi_quotes: bool,

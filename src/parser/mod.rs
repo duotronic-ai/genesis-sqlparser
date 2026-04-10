@@ -44,6 +44,7 @@ use crate::ast::{
 };
 use crate::dialect::*;
 use crate::keywords::{Keyword, ALL_KEYWORDS};
+use crate::mysql_mode::{parse_sql_mode, MySqlModeFlags};
 use crate::tokenizer::*;
 use sqlparser::parser::ParserState::ColumnDefinition;
 
@@ -544,6 +545,30 @@ impl<'a> Parser<'a> {
     /// ```
     pub fn parse_sql(dialect: &dyn Dialect, sql: &str) -> Result<Vec<Statement>, ParserError> {
         Parser::new(dialect).try_with_sql(sql)?.parse_statements()
+    }
+
+    /// Convenience method to parse SQL using the default MySQL dialect.
+    pub fn parse_mysql_sql(sql: &str) -> Result<Vec<Statement>, ParserError> {
+        Self::parse_sql(&ModeAwareMySqlDialect::default(), sql)
+    }
+
+    /// Convenience method to parse SQL using a MySQL dialect configured with
+    /// session `sql_mode` flags.
+    pub fn parse_mysql_sql_with_flags(
+        sql: &str,
+        mode_flags: MySqlModeFlags,
+    ) -> Result<Vec<Statement>, ParserError> {
+        let dialect = ModeAwareMySqlDialect::new(mode_flags);
+        Self::parse_sql(&dialect, sql)
+    }
+
+    /// Convenience method to parse SQL using a MySQL dialect configured from
+    /// a raw `sql_mode` string such as `ANSI_QUOTES,NO_BACKSLASH_ESCAPES`.
+    pub fn parse_mysql_sql_with_mode_string(
+        sql: &str,
+        sql_mode: &str,
+    ) -> Result<Vec<Statement>, ParserError> {
+        Self::parse_mysql_sql_with_flags(sql, parse_sql_mode(sql_mode))
     }
 
     /// Parses the given `sql` into an Abstract Syntax Tree (AST), returning

@@ -45,7 +45,7 @@ pub use self::duckdb::DuckDbDialect;
 pub use self::generic::GenericDialect;
 pub use self::hive::HiveDialect;
 pub use self::mssql::MsSqlDialect;
-pub use self::mysql::MySqlDialect;
+pub use self::mysql::{ModeAwareMySqlDialect, MySqlDialect};
 pub use self::oracle::OracleDialect;
 pub use self::postgresql::PostgreSqlDialect;
 pub use self::redshift::RedshiftSqlDialect;
