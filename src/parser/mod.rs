@@ -15382,6 +15382,13 @@ impl<'a> Parser<'a> {
             Err(ParserError::ParserError(
                 "EXTENDED/FULL are not supported with this type of SHOW query".to_string(),
             ))
+        } else if self.parse_keywords(&[Keyword::TABLE, Keyword::STATUS]) {
+            Ok(self.parse_show_table_status()?)
+        } else if self
+            .parse_one_of_keywords(&[Keyword::INDEX, Keyword::KEYS])
+            .is_some()
+        {
+            Ok(self.parse_show_index()?)
         } else if self.parse_one_of_keywords(&[Keyword::CREATE]).is_some() {
             Ok(self.parse_show_create()?)
         } else if self.parse_keyword(Keyword::COLLATION) {
@@ -15502,6 +15509,16 @@ impl<'a> Parser<'a> {
             external,
             show_options,
         })
+    }
+
+    fn parse_show_table_status(&mut self) -> Result<Statement, ParserError> {
+        let show_options = self.parse_show_stmt_options()?;
+        Ok(Statement::ShowTableStatus { show_options })
+    }
+
+    fn parse_show_index(&mut self) -> Result<Statement, ParserError> {
+        let show_options = self.parse_show_stmt_options()?;
+        Ok(Statement::ShowIndex { show_options })
     }
 
     fn parse_show_views(

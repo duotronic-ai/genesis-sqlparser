@@ -274,6 +274,8 @@ fn classify_statement(stmt: &Statement) -> StatementKind {
         | Statement::ShowCharset(_)
         | Statement::ShowObjects(_)
         | Statement::ShowTables { .. }
+        | Statement::ShowTableStatus { .. }
+        | Statement::ShowIndex { .. }
         | Statement::ShowViews { .. }
         | Statement::ShowCollation { .. } => StatementKind::Show,
         Statement::Set(_) => StatementKind::Set,
