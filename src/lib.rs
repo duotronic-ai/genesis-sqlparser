@@ -183,3 +183,16 @@ pub mod tokenizer;
 // unit-tests and by the integration tests <https://stackoverflow.com/a/44541071/1026>
 // External users are not supposed to rely on this module.
 pub mod test_utils;
+
+// ── Genesis extensions ──────────────────────────────────────────────────
+// Modules below this line are Genesis additions to the upstream sqlparser-rs
+// codebase. They provide MySQL→PostgreSQL translation support.
+
+/// Session-aware MySQL parsing mode flags (ANSI_QUOTES, NO_BACKSLASH_ESCAPES, etc.).
+pub mod mysql_mode;
+
+/// PG-targeted SQL emitter (backtick→double-quote, ?→$N, etc.).
+pub mod emitter;
+
+/// Translation-aware AST metadata (StatementKind, InsertStrategy, StmtFlags).
+pub mod metadata;
