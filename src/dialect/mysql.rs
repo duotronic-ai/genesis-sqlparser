@@ -495,12 +495,10 @@ mod tests {
 
     #[test]
     fn ansi_quotes_mode_parses_identifiers() {
-        let stmt = Parser::parse_mysql_sql_with_mode_string(
-            r#"SELECT "col" FROM "tbl""#,
-            "ANSI_QUOTES",
-        )
-            .unwrap()
-            .remove(0);
+        let stmt =
+            Parser::parse_mysql_sql_with_mode_string(r#"SELECT "col" FROM "tbl""#, "ANSI_QUOTES")
+                .unwrap()
+                .remove(0);
 
         let Statement::Query(query) = stmt else {
             panic!("expected query statement");
@@ -539,12 +537,10 @@ mod tests {
         let default_stmt = Parser::parse_mysql_sql("SELECT 'a' || 'b'")
             .unwrap()
             .remove(0);
-        let concat_stmt = Parser::parse_mysql_sql_with_mode_string(
-            "SELECT 'a' || 'b'",
-            "PIPES_AS_CONCAT",
-        )
-        .unwrap()
-        .remove(0);
+        let concat_stmt =
+            Parser::parse_mysql_sql_with_mode_string("SELECT 'a' || 'b'", "PIPES_AS_CONCAT")
+                .unwrap()
+                .remove(0);
 
         let Expr::BinaryOp { op, .. } = only_select_expr(&default_stmt) else {
             panic!("expected binary operator");

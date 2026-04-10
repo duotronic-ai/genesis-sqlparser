@@ -239,9 +239,7 @@ impl VisitorMut for PgRewriter<'_> {
 
     /// Rewrite LIMIT offset, count → LIMIT count OFFSET offset.
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        if let Some(LimitClause::OffsetCommaLimit { offset, limit }) =
-            query.limit_clause.take()
-        {
+        if let Some(LimitClause::OffsetCommaLimit { offset, limit }) = query.limit_clause.take() {
             query.limit_clause = Some(LimitClause::LimitOffset {
                 limit: Some(limit),
                 offset: Some(Offset {
@@ -449,10 +447,7 @@ mod tests {
     #[test]
     fn rewrites_placeholders_and_backtick_identifiers() {
         let emitted = emit_sql(r#"SELECT `user`.`name`, ?, ? FROM `accounts`"#);
-        assert_eq!(
-            emitted,
-            r#"SELECT "user"."name", $1, $2 FROM "accounts""#
-        );
+        assert_eq!(emitted, r#"SELECT "user"."name", $1, $2 FROM "accounts""#);
     }
 
     #[test]
@@ -478,9 +473,8 @@ mod tests {
 
     #[test]
     fn rewrites_nested_mysql_limit_offset_syntax() {
-        let emitted = emit_sql(
-            "SELECT * FROM (SELECT * FROM `events` LIMIT 1, 2) AS `e` LIMIT (3 + 4), 5",
-        );
+        let emitted =
+            emit_sql("SELECT * FROM (SELECT * FROM `events` LIMIT 1, 2) AS `e` LIMIT (3 + 4), 5");
         assert_eq!(
             emitted,
             r#"SELECT * FROM (SELECT * FROM "events" LIMIT 2 OFFSET 1) AS "e" LIMIT 5 OFFSET (3 + 4)"#
@@ -513,13 +507,9 @@ mod tests {
 
     #[test]
     fn rejects_on_duplicate_key_update() {
-        let err =
-            emit_sql_err("INSERT INTO `t` (`a`) VALUES (1) ON DUPLICATE KEY UPDATE `a` = 2");
+        let err = emit_sql_err("INSERT INTO `t` (`a`) VALUES (1) ON DUPLICATE KEY UPDATE `a` = 2");
         assert!(matches!(err, EmitError::UnsupportedNode(_)));
         let msg = err.to_string();
-        assert!(
-            msg.contains("ON DUPLICATE KEY UPDATE"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("ON DUPLICATE KEY UPDATE"), "got: {msg}");
     }
 }

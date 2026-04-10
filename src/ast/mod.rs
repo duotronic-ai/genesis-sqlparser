@@ -4156,6 +4156,22 @@ pub enum Statement {
         show_options: ShowStatementOptions,
     },
     /// ```sql
+    /// SHOW TABLE STATUS
+    /// ```
+    ShowTableStatus {
+        /// Additional options for `SHOW TABLE STATUS`.
+        show_options: ShowStatementOptions,
+    },
+    /// ```sql
+    /// SHOW {INDEX | KEYS}
+    /// ```
+    ///
+    /// Note: this is a MySQL-specific statement.
+    ShowIndex {
+        /// Additional options for `SHOW INDEX`.
+        show_options: ShowStatementOptions,
+    },
+    /// ```sql
     /// SHOW VIEWS
     /// ```
     ShowViews {
@@ -5777,6 +5793,14 @@ impl fmt::Display for Statement {
                     external = if *external { "EXTERNAL " } else { "" },
                     history = if *history { " HISTORY" } else { "" },
                 )?;
+                Ok(())
+            }
+            Statement::ShowTableStatus { show_options } => {
+                write!(f, "SHOW TABLE STATUS{show_options}")?;
+                Ok(())
+            }
+            Statement::ShowIndex { show_options } => {
+                write!(f, "SHOW INDEX{show_options}")?;
                 Ok(())
             }
             Statement::ShowViews {
