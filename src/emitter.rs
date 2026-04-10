@@ -17,7 +17,7 @@
 //! would corrupt escaped literals.
 
 use crate::ast::{
-    CreateTableOptions, Expr, Ident, LimitClause, Offset, OffsetRows, OnInsert, Query, SqlOption,
+    CreateTableOptions, Ident, LimitClause, Offset, OffsetRows, OnInsert, Query, SqlOption,
     Statement, Value, ValueWithSpan, VisitMut, VisitorMut,
 };
 use core::fmt;
@@ -58,8 +58,6 @@ pub trait SqlEmitter {
         stmt: &Statement,
         out: &mut W,
     ) -> Result<(), Self::Error>;
-    /// Emit a single SQL expression.
-    fn emit_expr<W: fmt::Write>(&mut self, expr: &Expr, out: &mut W) -> Result<(), Self::Error>;
 }
 
 /// PostgreSQL SQL emitter.
@@ -146,17 +144,6 @@ impl SqlEmitter for PgEmitter {
         //    remaining backtick-quoted identifiers that the visitor couldn't
         //    reach (column defs, non-expression aliases, etc.).
         let sql = stmt.to_string();
-        let fixed = rewrite_backtick_to_double_quote(&sql);
-        out.write_str(&fixed)?;
-        Ok(())
-    }
-
-    fn emit_expr<W: fmt::Write>(&mut self, expr: &Expr, out: &mut W) -> Result<(), EmitError> {
-        let mut expr = expr.clone();
-        let mut rewriter = PgRewriter { emitter: self };
-        let _ = expr.visit(&mut rewriter);
-
-        let sql = expr.to_string();
         let fixed = rewrite_backtick_to_double_quote(&sql);
         out.write_str(&fixed)?;
         Ok(())
@@ -252,7 +239,9 @@ impl VisitorMut for PgRewriter<'_> {
 
     /// Rewrite LIMIT offset, count → LIMIT count OFFSET offset.
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        if let Some(LimitClause::OffsetCommaLimit { offset, limit }) = query.limit_clause.take() {
+        if let Some(LimitClause::OffsetCommaLimit { offset, limit }) =
+            query.limit_clause.take()
+        {
             query.limit_clause = Some(LimitClause::LimitOffset {
                 limit: Some(limit),
                 offset: Some(Offset {
@@ -440,11 +429,7 @@ fn is_mysql_table_option_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ast::{SelectItem, SetExpr},
-        dialect::MySqlDialect,
-        parser::Parser,
-    };
+    use crate::{dialect::MySqlDialect, parser::Parser};
 
     fn emit_sql(sql: &str) -> String {
         let stmt = Parser::parse_sql(&MySqlDialect {}, sql).unwrap().remove(0);
@@ -461,28 +446,13 @@ mod tests {
         emitter.emit_statement(&stmt, &mut out).unwrap_err()
     }
 
-    fn emit_first_projection_expr(sql: &str) -> String {
-        let stmt = Parser::parse_sql(&MySqlDialect {}, sql).unwrap().remove(0);
-        let Statement::Query(query) = stmt else {
-            panic!("expected query");
-        };
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("expected select");
-        };
-        let SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
-            panic!("expected unnamed projection expression");
-        };
-
-        let mut emitter = PgEmitter::new(EmitOptions::postgres());
-        let mut out = String::new();
-        emitter.emit_expr(expr, &mut out).unwrap();
-        out
-    }
-
     #[test]
     fn rewrites_placeholders_and_backtick_identifiers() {
         let emitted = emit_sql(r#"SELECT `user`.`name`, ?, ? FROM `accounts`"#);
-        assert_eq!(emitted, r#"SELECT "user"."name", $1, $2 FROM "accounts""#);
+        assert_eq!(
+            emitted,
+            r#"SELECT "user"."name", $1, $2 FROM "accounts""#
+        );
     }
 
     #[test]
@@ -508,18 +478,13 @@ mod tests {
 
     #[test]
     fn rewrites_nested_mysql_limit_offset_syntax() {
-        let emitted =
-            emit_sql("SELECT * FROM (SELECT * FROM `events` LIMIT 1, 2) AS `e` LIMIT (3 + 4), 5");
+        let emitted = emit_sql(
+            "SELECT * FROM (SELECT * FROM `events` LIMIT 1, 2) AS `e` LIMIT (3 + 4), 5",
+        );
         assert_eq!(
             emitted,
             r#"SELECT * FROM (SELECT * FROM "events" LIMIT 2 OFFSET 1) AS "e" LIMIT 5 OFFSET (3 + 4)"#
         );
-    }
-
-    #[test]
-    fn emits_single_expressions_with_pg_rewrites() {
-        let emitted = emit_first_projection_expr(r#"SELECT `user`.`name` = ? OR "guest""#);
-        assert_eq!(emitted, r#""user"."name" = $1 OR 'guest'"#);
     }
 
     #[test]
@@ -548,9 +513,13 @@ mod tests {
 
     #[test]
     fn rejects_on_duplicate_key_update() {
-        let err = emit_sql_err("INSERT INTO `t` (`a`) VALUES (1) ON DUPLICATE KEY UPDATE `a` = 2");
+        let err =
+            emit_sql_err("INSERT INTO `t` (`a`) VALUES (1) ON DUPLICATE KEY UPDATE `a` = 2");
         assert!(matches!(err, EmitError::UnsupportedNode(_)));
         let msg = err.to_string();
-        assert!(msg.contains("ON DUPLICATE KEY UPDATE"), "got: {msg}");
+        assert!(
+            msg.contains("ON DUPLICATE KEY UPDATE"),
+            "got: {msg}"
+        );
     }
 }
