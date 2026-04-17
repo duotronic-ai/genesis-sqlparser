@@ -239,16 +239,19 @@ impl VisitorMut for PgRewriter<'_> {
 
     /// Rewrite LIMIT offset, count → LIMIT count OFFSET offset.
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        if let Some(LimitClause::OffsetCommaLimit { offset, limit }) = query.limit_clause.take() {
-            query.limit_clause = Some(LimitClause::LimitOffset {
-                limit: Some(limit),
-                offset: Some(Offset {
-                    value: offset,
-                    rows: OffsetRows::None,
-                }),
-                limit_by: vec![],
-            });
-        }
+        query.limit_clause = match query.limit_clause.take() {
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                Some(LimitClause::LimitOffset {
+                    limit: Some(limit),
+                    offset: Some(Offset {
+                        value: offset,
+                        rows: OffsetRows::None,
+                    }),
+                    limit_by: vec![],
+                })
+            }
+            other => other,
+        };
         ControlFlow::Continue(())
     }
 
@@ -478,6 +481,15 @@ mod tests {
         assert_eq!(
             emitted,
             r#"SELECT * FROM (SELECT * FROM "events" LIMIT 2 OFFSET 1) AS "e" LIMIT 5 OFFSET (3 + 4)"#
+        );
+    }
+
+    #[test]
+    fn preserves_standard_limit_placeholders() {
+        let emitted = emit_sql("SELECT * FROM `events` WHERE `id` = ? LIMIT ?");
+        assert_eq!(
+            emitted,
+            r#"SELECT * FROM "events" WHERE "id" = $1 LIMIT $2"#
         );
     }
 
