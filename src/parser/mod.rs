@@ -12381,6 +12381,36 @@ impl<'a> Parser<'a> {
                 Keyword::NVARCHAR => {
                     Ok(DataType::Nvarchar(self.parse_optional_character_length()?))
                 }
+                Keyword::NCHAR => {
+                    if self.parse_keyword(Keyword::VARCHAR) || self.parse_keyword(Keyword::VARYING)
+                    {
+                        Ok(DataType::Nvarchar(self.parse_optional_character_length()?))
+                    } else {
+                        Ok(DataType::Char(self.parse_optional_character_length()?))
+                    }
+                }
+                Keyword::NATIONAL => {
+                    if self.parse_keyword(Keyword::VARCHAR) {
+                        Ok(DataType::Nvarchar(self.parse_optional_character_length()?))
+                    } else if self.parse_keyword(Keyword::CHAR) {
+                        if self.parse_keyword(Keyword::VARYING) {
+                            Ok(DataType::Nvarchar(self.parse_optional_character_length()?))
+                        } else {
+                            Ok(DataType::Char(self.parse_optional_character_length()?))
+                        }
+                    } else if self.parse_keyword(Keyword::CHARACTER) {
+                        if self.parse_keyword(Keyword::VARYING) {
+                            Ok(DataType::Nvarchar(self.parse_optional_character_length()?))
+                        } else {
+                            Ok(DataType::Character(self.parse_optional_character_length()?))
+                        }
+                    } else {
+                        self.expected_ref(
+                            "CHAR, CHARACTER, or VARCHAR after NATIONAL",
+                            self.peek_token_ref(),
+                        )
+                    }
+                }
                 Keyword::CHARACTER => {
                     if self.parse_keyword(Keyword::VARYING) {
                         Ok(DataType::CharacterVarying(
@@ -20553,7 +20583,7 @@ mod tests {
         use crate::ast::{
             CharLengthUnits, CharacterLength, DataType, ExactNumberInfo, ObjectName, TimezoneInfo,
         };
-        use crate::dialect::{AnsiDialect, GenericDialect, PostgreSqlDialect};
+        use crate::dialect::{AnsiDialect, GenericDialect, MySqlDialect, PostgreSqlDialect};
         use crate::test_utils::TestedDialects;
 
         macro_rules! test_parse_data_type {
@@ -20692,6 +20722,77 @@ mod tests {
                     unit: None
                 }))
             );
+        }
+
+        #[test]
+        fn test_mysql_national_character_string_aliases() {
+            let dialect = TestedDialects::new(vec![Box::new(MySqlDialect {})]);
+
+            fn assert_data_type(
+                dialect: &TestedDialects,
+                input: &str,
+                expected_type: DataType,
+                expected_display: &str,
+            ) {
+                dialect.run_parser_method(input, |parser| {
+                    let data_type = parser.parse_data_type().unwrap();
+                    assert_eq!(expected_type, data_type);
+                    assert_eq!(expected_display, data_type.to_string());
+                });
+            }
+
+            assert_data_type(&dialect, "NATIONAL CHAR", DataType::Char(None), "CHAR");
+            assert_data_type(&dialect, "NCHAR", DataType::Char(None), "CHAR");
+            assert_data_type(
+                &dialect,
+                "NATIONAL CHAR(10)",
+                DataType::Char(Some(CharacterLength::IntegerLength {
+                    length: 10,
+                    unit: None,
+                })),
+                "CHAR(10)",
+            );
+            assert_data_type(
+                &dialect,
+                "NCHAR(10)",
+                DataType::Char(Some(CharacterLength::IntegerLength {
+                    length: 10,
+                    unit: None,
+                })),
+                "CHAR(10)",
+            );
+            assert_data_type(
+                &dialect,
+                "NATIONAL CHARACTER(10)",
+                DataType::Character(Some(CharacterLength::IntegerLength {
+                    length: 10,
+                    unit: None,
+                })),
+                "CHARACTER(10)",
+            );
+            for input in [
+                "NATIONAL VARCHAR(255)",
+                "NATIONAL CHAR VARYING(255)",
+                "NATIONAL CHARACTER VARYING(255)",
+                "NCHAR VARCHAR(255)",
+                "NCHAR VARYING(255)",
+                "NVARCHAR(255)",
+            ] {
+                assert_data_type(
+                    &dialect,
+                    input,
+                    DataType::Nvarchar(Some(CharacterLength::IntegerLength {
+                        length: 255,
+                        unit: None,
+                    })),
+                    "NVARCHAR(255)",
+                );
+            }
+
+            dialect.run_parser_method("NATIONAL INTEGER", |parser| {
+                let error = parser.parse_data_type().unwrap_err().to_string();
+                assert!(error.contains("Expected: CHAR, CHARACTER, or VARCHAR after NATIONAL"));
+            });
         }
 
         #[test]
