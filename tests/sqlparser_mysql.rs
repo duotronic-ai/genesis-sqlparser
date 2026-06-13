@@ -548,6 +548,30 @@ fn parse_show_extended_full() {
 }
 
 #[test]
+fn parse_show_indexes_where() {
+    assert_eq!(
+        mysql_and_generic().verified_stmt("SHOW INDEXES FROM mytable WHERE Key_name = 'a_key'"),
+        Statement::ShowIndex {
+            show_options: ShowStatementOptions {
+                show_in: Some(ShowStatementIn {
+                    clause: ShowStatementInClause::FROM,
+                    parent_type: None,
+                    parent_name: Some(ObjectName::from(vec![Ident::new("mytable")])),
+                }),
+                filter_position: Some(ShowStatementFilterPosition::Suffix(
+                    ShowStatementFilter::Where(
+                        mysql_and_generic().verified_expr("Key_name = 'a_key'")
+                    )
+                )),
+                limit_from: None,
+                limit: None,
+                starts_with: None,
+            },
+        }
+    );
+}
+
+#[test]
 fn parse_show_create() {
     let obj_name = ObjectName::from(vec![Ident::new("myident")]);
 

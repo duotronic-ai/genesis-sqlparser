@@ -15415,7 +15415,7 @@ impl<'a> Parser<'a> {
         } else if self.parse_keywords(&[Keyword::TABLE, Keyword::STATUS]) {
             Ok(self.parse_show_table_status()?)
         } else if self
-            .parse_one_of_keywords(&[Keyword::INDEX, Keyword::KEYS])
+            .parse_one_of_keywords(&[Keyword::INDEX, Keyword::INDEXES, Keyword::KEYS])
             .is_some()
         {
             Ok(self.parse_show_index()?)
