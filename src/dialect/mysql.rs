@@ -20,7 +20,7 @@ use alloc::boxed::Box;
 use core::any::TypeId;
 
 use crate::{
-    ast::{BinaryOperator, Expr, LockTable, LockTableType, Statement},
+    ast::{BinaryOperator, CastKind, DataType, Expr, LockTable, LockTableType, Statement},
     dialect::Dialect,
     keywords::Keyword,
     mysql_mode::{parse_sql_mode, MySqlLexerMode, MySqlModeFlags},
@@ -138,6 +138,10 @@ impl Dialect for MySqlDialect {
     /// see <https://dev.mysql.com/doc/refman/8.4/en/comments.html>
     fn supports_multiline_comment_hints(&self) -> bool {
         true
+    }
+
+    fn parse_prefix(&self, parser: &mut Parser) -> Option<Result<Expr, ParserError>> {
+        parse_binary_prefix_cast(parser, self.prec_value(super::Precedence::Eq))
     }
 
     fn parse_infix(
@@ -315,6 +319,10 @@ impl Dialect for ModeAwareMySqlDialect {
         MySqlDialect {}.supports_multiline_comment_hints()
     }
 
+    fn parse_prefix(&self, parser: &mut Parser) -> Option<Result<Expr, ParserError>> {
+        parse_binary_prefix_cast(parser, self.prec_value(super::Precedence::Eq))
+    }
+
     fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
         if matches!(parser.peek_token_ref().token, Token::StringConcat)
             && !self.mode_flags.contains(MySqlModeFlags::PIPES_AS_CONCAT)
@@ -430,6 +438,27 @@ impl Dialect for ModeAwareMySqlDialect {
     fn supports_key_column_option(&self) -> bool {
         MySqlDialect {}.supports_key_column_option()
     }
+}
+
+fn parse_binary_prefix_cast(
+    parser: &mut Parser,
+    operand_precedence: u8,
+) -> Option<Result<Expr, ParserError>> {
+    if !parser.parse_keyword(Keyword::BINARY) {
+        return None;
+    }
+
+    Some(
+        parser
+            .parse_subexpr(operand_precedence)
+            .map(|expr| Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(expr),
+                data_type: DataType::Binary(None),
+                array: false,
+                format: None,
+            }),
+    )
 }
 
 /// `LOCK TABLES`
@@ -551,6 +580,26 @@ mod tests {
             panic!("expected binary operator");
         };
         assert_eq!(*op, BinaryOperator::StringConcat);
+    }
+
+    #[test]
+    fn binary_prefix_parenthesized_operand_stays_cast_operand() {
+        let stmt = Parser::parse_mysql_sql("SELECT BINARY (a || b) = 'x' FROM t")
+            .unwrap()
+            .remove(0);
+
+        let Expr::BinaryOp { left, .. } = only_select_expr(&stmt) else {
+            panic!("expected comparison expression");
+        };
+        let Expr::Cast {
+            expr, data_type, ..
+        } = left.as_ref()
+        else {
+            panic!("expected BINARY prefix cast, got {left:?}");
+        };
+
+        assert!(matches!(data_type, DataType::Binary(None)));
+        assert!(matches!(expr.as_ref(), Expr::Nested(_)));
     }
 }
 

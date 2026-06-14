@@ -152,6 +152,10 @@ impl Dialect for SessionMySqlDialect {
         <MySqlDialect as Dialect>::supports_multiline_comment_hints(&self.base)
     }
 
+    fn parse_prefix(&self, parser: &mut Parser) -> Option<Result<crate::ast::Expr, ParserError>> {
+        <MySqlDialect as Dialect>::parse_prefix(&self.base, parser)
+    }
+
     fn parse_infix(
         &self,
         parser: &mut Parser,
